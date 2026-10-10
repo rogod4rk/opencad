@@ -6,8 +6,8 @@ mod model;
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Stroke};
 use model::{apply_grip, arc3, array_polar, array_rect, break_line, chamfer_lines, dim_geom, ellipse, entity_in_box,
-            entity_segs, extend_line, fillet_lines, grips_of, join_lines, nearest_point, offset_entity, parse_coord,
-            seg_inter, trim_line, Document, Entity, Grip, Pt};
+            entity_segs, explode_entity, extend_line, fillet_lines, grips_of, join_lines, nearest_point, offset_entity,
+            parse_coord, seg_inter, trim_line, Document, Entity, Grip, Pt};
 use std::f64::consts::TAU;
 use std::collections::HashSet;
 
@@ -122,6 +122,7 @@ fn alias(n: &str) -> &str {
         "ARRAYPOLAR" | "ARPOLAR" => "ARRAYPOLAR",
         "BR" | "BREAK" => "BREAK",
         "J" | "JOIN" => "JOIN",
+        "X" | "EXPLODE" => "EXPLODE",
         "U" | "UNDO" => "UNDO",
         "REDO" | "MREDO" => "REDO",
         "Z" | "ZOOM" => "ZOOM",
@@ -807,6 +808,25 @@ impl App {
             }
             "BREAK" => { self.cmd = Cmd::Break { ent: None, p1: None }; self.prompt = "Select the line to break".into(); }
             "JOIN" => { self.cmd = Cmd::Join { first: None }; self.prompt = "Select first line to join".into(); }
+            "EXPLODE" => {
+                if self.sel.is_empty() { self.prompt = "Select object(s) first, then EXPLODE".into(); }
+                else {
+                    let mut ids: Vec<usize> = self.sel.iter().copied().filter(|&i| i < self.doc.objs.len()).collect();
+                    ids.sort_unstable(); ids.reverse(); // remove high-to-low so indices stay valid
+                    let mut n = 0;
+                    for i in ids {
+                        if let Some(parts) = explode_entity(&self.doc.objs[i].e) {
+                            let layer = self.doc.objs[i].layer.clone();
+                            self.doc.objs.remove(i);
+                            for e in parts { self.doc.add_on(e, &layer); }
+                            n += 1;
+                        }
+                    }
+                    self.clear_refs();
+                    if n > 0 { self.doc.commit(); self.prompt = format!("Exploded {} object(s)", n); }
+                    else { self.prompt = "Nothing there explodes (rect/polyline/dim only)".into(); }
+                }
+            }
             "ERASE" => {
                 if !self.sel.is_empty() {
                     let mut ids: Vec<usize> = self.sel.iter().copied().collect();
@@ -972,6 +992,13 @@ impl App {
     }
 }
 
+/// A compact ribbon tool button (label + hover tooltip). Returns whether it was clicked.
+fn tool_btn(ui: &mut egui::Ui, label: &str, tip: &str) -> bool {
+    ui.add(egui::Button::new(egui::RichText::new(label).size(12.0)).min_size(egui::vec2(36.0, 30.0)))
+        .on_hover_text(tip)
+        .clicked()
+}
+
 fn draw_grid(p: &egui::Painter, v: &View, rect: egui::Rect, c: Pos2) {
     let tl = v.to_world(rect.left_top(), c);
     let br = v.to_world(rect.right_bottom(), c);
@@ -1110,12 +1137,80 @@ impl eframe::App for App {
             }
         }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("◢ OpenCAD").color(Color32::from_rgb(55, 212, 232)));
-                ui.label(egui::RichText::new("native · Rust").small().color(Color32::GRAY));
+        let draw_tools: &[(&'static str, &'static str, &'static str)] = &[
+            ("Line", "LINE", "Line  (L)"), ("Pline", "PLINE", "Polyline  (PL)"), ("Circle", "CIRCLE", "Circle  (C)"),
+            ("Arc", "ARC", "Arc, 3-point  (A)"), ("Rect", "RECTANG", "Rectangle  (REC)"), ("Polygon", "POLYGON", "Polygon  (POL)"),
+            ("Ellipse", "ELLIPSE", "Ellipse  (EL)"), ("Point", "POINT", "Point  (PO)"), ("Text", "TEXT", "Text  (T)"),
+        ];
+        let modify_tools: &[(&'static str, &'static str, &'static str)] = &[
+            ("Move", "MOVE", "Move  (M) — select first"), ("Copy", "COPY", "Copy  (CO)"), ("Rotate", "ROTATE", "Rotate  (RO)"),
+            ("Mirror", "MIRROR", "Mirror  (MI)"), ("Scale", "SCALE", "Scale  (SC)"), ("Offset", "OFFSET", "Offset  (O)"),
+            ("Array", "ARRAYRECT", "Rectangular array  (AR)"), ("Polar", "ARRAYPOLAR", "Polar array"),
+            ("Trim", "TRIM", "Trim  (TR)"), ("Extend", "EXTEND", "Extend  (EX)"), ("Fillet", "FILLET", "Fillet  (F)"),
+            ("Chamfer", "CHAMFER", "Chamfer  (CHA)"), ("Break", "BREAK", "Break  (BR)"), ("Join", "JOIN", "Join  (J)"),
+            ("Explode", "EXPLODE", "Explode  (X)"), ("Erase", "ERASE", "Erase  (E)"),
+        ];
+        let anno_tools: &[(&'static str, &'static str, &'static str)] = &[("Linear", "DIMLINEAR", "Linear dimension  (DLI)")];
+        let mut fire: Option<&'static str> = None;
+
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("New").clicked() { self.doc = Document::new(); self.clear_refs(); self.end_cmd(); self.zoom_extents(); ui.close_menu(); }
+                    if ui.button("Import DXF (opencad.dxf)").clicked() {
+                        match std::fs::read("opencad.dxf") {
+                            Ok(b) => { self.import_bytes(&b); self.prompt = format!("Imported {} entities", self.doc.objs.len()); }
+                            Err(e) => { self.prompt = format!("Import failed: {}", e); }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Export DXF → opencad.dxf").clicked() {
+                        self.prompt = match std::fs::write("opencad.dxf", self.doc.to_dxf()) {
+                            Ok(_) => "Wrote opencad.dxf".into(), Err(e) => format!("Export failed: {}", e),
+                        };
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Undo").clicked() { self.do_undo(); ui.close_menu(); }
+                    if ui.button("Redo").clicked() { self.do_redo(); ui.close_menu(); }
+                });
+                ui.menu_button("Draw", |ui| { for (l, c, _) in draw_tools { if ui.button(*l).clicked() { fire = Some(c); ui.close_menu(); } } });
+                ui.menu_button("Modify", |ui| { for (l, c, _) in modify_tools { if ui.button(*l).clicked() { fire = Some(c); ui.close_menu(); } } });
+                ui.menu_button("View", |ui| {
+                    if ui.button("Zoom Extents").clicked() { self.zoom_extents(); ui.close_menu(); }
+                    ui.separator();
+                    ui.checkbox(&mut self.grid, "Grid (F7)");
+                    ui.checkbox(&mut self.osnap, "Object snap (F3)");
+                    ui.checkbox(&mut self.ortho, "Ortho (F8)");
+                    ui.checkbox(&mut self.snap_grid, "Snap to grid (F9)");
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("native · Rust").small().color(Color32::from_rgb(120, 140, 160)));
+                    ui.label(egui::RichText::new("◢ OpenCAD").strong().color(Color32::from_rgb(55, 212, 232)));
+                });
             });
         });
+
+        egui::TopBottomPanel::top("ribbon").show(ctx, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                let group = |ui: &mut egui::Ui, title: &str, tools: &[(&'static str, &'static str, &'static str)], fire: &mut Option<&'static str>| {
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| { for (l, c, t) in tools { if tool_btn(ui, l, t) { *fire = Some(*c); } } });
+                        ui.add_space(1.0);
+                        ui.label(egui::RichText::new(title).size(9.0).color(Color32::from_rgb(120, 140, 160)));
+                    });
+                };
+                group(ui, "DRAW", draw_tools, &mut fire);
+                ui.separator();
+                group(ui, "MODIFY", modify_tools, &mut fire);
+                ui.separator();
+                group(ui, "ANNOTATE", anno_tools, &mut fire);
+            });
+            ui.add_space(3.0);
+        });
+        if let Some(c) = fire { self.start_cmd(c); }
 
         egui::TopBottomPanel::bottom("cmdline").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1207,15 +1302,6 @@ impl eframe::App for App {
                     }
                 }
             });
-            ui.separator();
-            ui.label(egui::RichText::new("COMMANDS (live)").small().strong());
-            for cmd in ["LINE / L", "PLINE / PL", "RECTANG / REC", "CIRCLE / C", "ARC / A", "ELLIPSE / EL",
-                        "POLYGON / POL", "TEXT / T", "MOVE / M", "COPY / CO", "ROTATE / RO", "SCALE / SC",
-                        "MIRROR / MI", "OFFSET / O", "TRIM / TR", "EXTEND / EX", "FILLET / F", "CHAMFER / CHA",
-                        "ARRAY / AR", "ARRAYPOLAR", "BREAK / BR", "JOIN / J", "ERASE / E", "DIMLINEAR / DLI",
-                        "ZOOM / Z", "UNDO / U", "REDO"] {
-                ui.monospace(cmd);
-            }
             ui.separator();
             if ui.button("Export DXF → opencad.dxf").clicked() {
                 self.prompt = match std::fs::write("opencad.dxf", self.doc.to_dxf()) {
