@@ -7,6 +7,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# the release job needs write access to create the GitHub Release and attach installers
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
