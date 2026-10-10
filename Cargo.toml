@@ -1,0 +1,22 @@
+[package]
+name = "opencad-native"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# glow (OpenGL) backend: lighter + faster to compile than wgpu, still GPU-accelerated.
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# `cargo install cargo-bundle` then `cargo bundle --release` packages a native app
+# (.app/.dmg on macOS, .deb on Linux, .msi via the CI workflow on Windows).
+[package.metadata.bundle]
+name = "OpenCAD"
+identifier = "org.opencad.app"
+short_description = "Open-source AutoCAD-style 2D CAD"
+category = "public.app-category.graphics-design"
+icon = ["assets/icon.icns", "assets/icon.png"]
