@@ -94,7 +94,11 @@ enum Cmd {
     ArrayPolar { center: Option<Pt>, count: Option<usize> },
     Break { ent: Option<usize>, p1: Option<Pt> },
     Join { first: Option<usize> },
+    Point,
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Confirm { New, Import }
 
 fn alias(n: &str) -> &str {
     match n {
@@ -123,6 +127,7 @@ fn alias(n: &str) -> &str {
         "BR" | "BREAK" => "BREAK",
         "J" | "JOIN" => "JOIN",
         "X" | "EXPLODE" => "EXPLODE",
+        "PO" | "POINT" => "POINT",
         "U" | "UNDO" => "UNDO",
         "REDO" | "MREDO" => "REDO",
         "Z" | "ZOOM" => "ZOOM",
@@ -150,6 +155,10 @@ struct App {
     grip_drag: Option<(usize, Grip)>,
     snap_marker: Option<(Pt, SnapKind)>,
     new_layer: String,
+    ribbon_tab: usize,
+    polar: bool,
+    lwt: bool,
+    confirm: Option<Confirm>,
 }
 
 #[derive(Clone, Copy)]
@@ -177,6 +186,18 @@ impl App {
             grip_drag: None,
             snap_marker: None,
             new_layer: String::new(),
+            ribbon_tab: 0,
+            polar: false,
+            lwt: false,
+            confirm: None,
+        }
+    }
+
+    fn do_new(&mut self) { self.doc = Document::new(); self.clear_refs(); self.end_cmd(); self.zoom_extents(); }
+    fn do_import_file(&mut self) {
+        match std::fs::read("opencad.dxf") {
+            Ok(b) => { self.import_bytes(&b); self.prompt = format!("Imported {} entities", self.doc.objs.len()); }
+            Err(e) => { self.prompt = format!("Import failed: {}", e); }
         }
     }
 
@@ -608,6 +629,12 @@ impl App {
                     } else { self.cmd = Cmd::Join { first: Some(i) }; self.prompt = "Select second line to join".into(); }
                 } else { self.cmd = Cmd::Join { first }; }
             }
+            Cmd::Point => {
+                self.doc.add(Entity::Point { x: p.0, y: p.1 });
+                self.doc.commit();
+                self.cmd = Cmd::Point; // AutoCAD-style: keep placing until Esc
+                self.prompt = "Specify a point (Esc to finish)".into();
+            }
             Cmd::Erase => {
                 if let Some(i) = self.hit(p) { self.doc.objs.remove(i); self.doc.commit(); self.clear_refs(); }
                 self.cmd = Cmd::Erase;
@@ -796,6 +823,7 @@ impl App {
             "FILLET" => { self.cmd = Cmd::Fillet { first: None }; self.prompt = format!("Select first line (radius {}; type a number to change)", self.fillet_r); }
             "CHAMFER" => { self.cmd = Cmd::Chamfer { first: None }; self.prompt = format!("Select first line (distance {}; type a number to change)", self.chamfer_d); }
             "ELLIPSE" => { self.cmd = Cmd::Ellipse { center: None, major: None }; self.prompt = "Specify center of ellipse".into(); }
+            "POINT" => { self.cmd = Cmd::Point; self.prompt = "Specify a point (Esc to finish)".into(); }
             "TEXT" => { self.cmd = Cmd::Text { pos: None, height: None }; self.prompt = "Specify start point of text".into(); }
             "DIMLINEAR" => { self.cmd = Cmd::DimLinear { pts: vec![] }; self.prompt = "Specify first extension line origin".into(); }
             "ARRAYRECT" => {
@@ -999,6 +1027,64 @@ fn tool_btn(ui: &mut egui::Ui, label: &str, tip: &str) -> bool {
         .clicked()
 }
 
+/// Paint a small vector icon for a command inside `r` (AutoCAD-style line glyphs).
+fn paint_icon(p: &egui::Painter, r: egui::Rect, name: &str, col: Color32) {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let st = Stroke::new(1.5_f32, col);
+    let m = |u: f32, v: f32| Pos2::new(r.min.x + u * r.width(), r.min.y + v * r.height());
+    let line = |a: (f32, f32), b: (f32, f32)| { p.line_segment([m(a.0, a.1), m(b.0, b.1)], st); };
+    let poly = |pts: &[(f32, f32)], closed: bool| {
+        for w in pts.windows(2) { p.line_segment([m(w[0].0, w[0].1), m(w[1].0, w[1].1)], st); }
+        if closed && pts.len() > 1 { let a = pts[pts.len() - 1]; let b = pts[0]; p.line_segment([m(a.0, a.1), m(b.0, b.1)], st); }
+    };
+    let circ = |c: (f32, f32), rad: f32| { p.circle_stroke(m(c.0, c.1), rad * r.width(), st); };
+    let arc = |c: (f32, f32), rad: f32, a0: f32, a1: f32| {
+        let n = 12; let pts: Vec<Pos2> = (0..=n).map(|i| { let t = a0 + (a1 - a0) * i as f32 / n as f32; m(c.0 + rad * t.cos(), c.1 - rad * t.sin()) }).collect();
+        for w in pts.windows(2) { p.line_segment([w[0], w[1]], st); }
+    };
+    match name {
+        "LINE" => line((0.12, 0.88), (0.88, 0.12)),
+        "PLINE" => poly(&[(0.1, 0.8), (0.4, 0.3), (0.6, 0.7), (0.9, 0.2)], false),
+        "CIRCLE" => circ((0.5, 0.5), 0.4),
+        "ARC" => arc((0.5, 0.6), 0.4, 0.2, 2.9),
+        "RECTANG" => poly(&[(0.14, 0.26), (0.86, 0.26), (0.86, 0.74), (0.14, 0.74)], true),
+        "POLYGON" => { let pts: Vec<(f32, f32)> = (0..6).map(|i| { let a = TAU * i as f32 / 6.0 - FRAC_PI_2; (0.5 + 0.38 * a.cos(), 0.5 + 0.38 * a.sin()) }).collect(); poly(&pts, true); }
+        "ELLIPSE" => { let pts: Vec<Pos2> = (0..=16).map(|i| { let t = TAU * i as f32 / 16.0; m(0.5 + 0.42 * t.cos(), 0.5 + 0.28 * t.sin()) }).collect(); for w in pts.windows(2) { p.line_segment([w[0], w[1]], st); } }
+        "POINT" => { line((0.5, 0.22), (0.5, 0.78)); line((0.22, 0.5), (0.78, 0.5)); }
+        "TEXT" => { line((0.26, 0.84), (0.5, 0.16)); line((0.5, 0.16), (0.74, 0.84)); line((0.36, 0.56), (0.64, 0.56)); }
+        "MOVE" => { line((0.5, 0.14), (0.5, 0.86)); line((0.14, 0.5), (0.86, 0.5)); line((0.5, 0.14), (0.42, 0.26)); line((0.5, 0.14), (0.58, 0.26)); line((0.14, 0.5), (0.26, 0.42)); line((0.14, 0.5), (0.26, 0.58)); }
+        "COPY" => { poly(&[(0.14, 0.36), (0.6, 0.36), (0.6, 0.82), (0.14, 0.82)], true); poly(&[(0.4, 0.16), (0.86, 0.16), (0.86, 0.62), (0.4, 0.62)], true); }
+        "ROTATE" => { arc((0.5, 0.5), 0.36, 0.6, 5.0); line((0.86, 0.46), (0.82, 0.58)); line((0.86, 0.46), (0.74, 0.5)); }
+        "MIRROR" => { poly(&[(0.12, 0.8), (0.4, 0.8), (0.12, 0.2)], true); poly(&[(0.88, 0.8), (0.6, 0.8), (0.88, 0.2)], true); p.line_segment([m(0.5, 0.08), m(0.5, 0.92)], Stroke::new(1.0_f32, col)); }
+        "SCALE" => { poly(&[(0.2, 0.6), (0.5, 0.6), (0.5, 0.9), (0.2, 0.9)], true); poly(&[(0.2, 0.2), (0.82, 0.2), (0.82, 0.82)], false); }
+        "OFFSET" => { poly(&[(0.2, 0.74), (0.5, 0.26), (0.8, 0.74)], false); poly(&[(0.32, 0.84), (0.5, 0.52), (0.68, 0.84)], false); }
+        "TRIM" => { line((0.14, 0.52), (0.86, 0.52)); line((0.56, 0.18), (0.72, 0.82)); }
+        "EXTEND" => { line((0.14, 0.5), (0.64, 0.5)); line((0.64, 0.5), (0.54, 0.42)); line((0.64, 0.5), (0.54, 0.58)); line((0.86, 0.18), (0.86, 0.82)); }
+        "FILLET" => { line((0.22, 0.18), (0.22, 0.5)); arc((0.52, 0.5), 0.3, FRAC_PI_2, std::f32::consts::PI); line((0.52, 0.8), (0.82, 0.8)); }
+        "CHAMFER" => { line((0.2, 0.8), (0.5, 0.8)); line((0.5, 0.8), (0.8, 0.5)); line((0.8, 0.5), (0.8, 0.2)); }
+        "ARRAYRECT" => { for rr in 0..3 { for cc in 0..3 { circ((0.26 + cc as f32 * 0.24, 0.26 + rr as f32 * 0.24), 0.035); } } }
+        "ARRAYPOLAR" => { for i in 0..6 { let a = TAU * i as f32 / 6.0; circ((0.5 + 0.32 * a.cos(), 0.5 + 0.32 * a.sin()), 0.05); } }
+        "BREAK" => { line((0.14, 0.5), (0.42, 0.5)); line((0.58, 0.5), (0.86, 0.5)); }
+        "JOIN" => { line((0.14, 0.62), (0.46, 0.62)); line((0.54, 0.38), (0.86, 0.38)); line((0.46, 0.62), (0.54, 0.38)); }
+        "EXPLODE" => { circ((0.5, 0.5), 0.08); for i in 0..6 { let a = TAU * i as f32 / 6.0; line((0.5 + 0.2 * a.cos(), 0.5 + 0.2 * a.sin()), (0.5 + 0.42 * a.cos(), 0.5 + 0.42 * a.sin())); } }
+        "ERASE" => { poly(&[(0.24, 0.6), (0.54, 0.3), (0.76, 0.52), (0.46, 0.82)], true); line((0.46, 0.82), (0.82, 0.82)); }
+        "DIMLINEAR" => { line((0.14, 0.4), (0.14, 0.82)); line((0.86, 0.4), (0.86, 0.82)); line((0.14, 0.6), (0.86, 0.6)); line((0.14, 0.6), (0.26, 0.54)); line((0.14, 0.6), (0.26, 0.66)); line((0.86, 0.6), (0.74, 0.54)); line((0.86, 0.6), (0.74, 0.66)); }
+        _ => circ((0.5, 0.5), 0.3),
+    }
+}
+
+/// A ribbon icon button: vector glyph above a small label, hover highlight + tooltip.
+fn icon_btn(ui: &mut egui::Ui, name: &str, label: &str, tip: &str) -> bool {
+    let size = egui::vec2(48.0, 50.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let p = ui.painter();
+    if resp.hovered() { p.rect_filled(rect, egui::Rounding::same(5.0), Color32::from_rgb(42, 54, 68)); }
+    let ic = egui::Rect::from_min_size(Pos2::new(rect.center().x - 11.0, rect.min.y + 6.0), egui::vec2(22.0, 22.0));
+    paint_icon(p, ic, name, Color32::from_rgb(214, 224, 236));
+    p.text(Pos2::new(rect.center().x, rect.max.y - 8.0), Align2::CENTER_CENTER, label, FontId::proportional(8.5), Color32::from_rgb(168, 182, 198));
+    resp.on_hover_text(tip).clicked()
+}
+
 fn draw_grid(p: &egui::Painter, v: &View, rect: egui::Rect, c: Pos2) {
     let tl = v.to_world(rect.left_top(), c);
     let br = v.to_world(rect.right_bottom(), c);
@@ -1140,30 +1226,28 @@ impl eframe::App for App {
         let draw_tools: &[(&'static str, &'static str, &'static str)] = &[
             ("Line", "LINE", "Line  (L)"), ("Pline", "PLINE", "Polyline  (PL)"), ("Circle", "CIRCLE", "Circle  (C)"),
             ("Arc", "ARC", "Arc, 3-point  (A)"), ("Rect", "RECTANG", "Rectangle  (REC)"), ("Polygon", "POLYGON", "Polygon  (POL)"),
-            ("Ellipse", "ELLIPSE", "Ellipse  (EL)"), ("Point", "POINT", "Point  (PO)"), ("Text", "TEXT", "Text  (T)"),
+            ("Ellipse", "ELLIPSE", "Ellipse  (EL)"), ("Point", "POINT", "Point  (PO)"),
         ];
         let modify_tools: &[(&'static str, &'static str, &'static str)] = &[
             ("Move", "MOVE", "Move  (M) — select first"), ("Copy", "COPY", "Copy  (CO)"), ("Rotate", "ROTATE", "Rotate  (RO)"),
             ("Mirror", "MIRROR", "Mirror  (MI)"), ("Scale", "SCALE", "Scale  (SC)"), ("Offset", "OFFSET", "Offset  (O)"),
-            ("Array", "ARRAYRECT", "Rectangular array  (AR)"), ("Polar", "ARRAYPOLAR", "Polar array"),
             ("Trim", "TRIM", "Trim  (TR)"), ("Extend", "EXTEND", "Extend  (EX)"), ("Fillet", "FILLET", "Fillet  (F)"),
-            ("Chamfer", "CHAMFER", "Chamfer  (CHA)"), ("Break", "BREAK", "Break  (BR)"), ("Join", "JOIN", "Join  (J)"),
+            ("Chamfer", "CHAMFER", "Chamfer  (CHA)"), ("Array", "ARRAYRECT", "Rectangular array  (AR)"),
+            ("Polar", "ARRAYPOLAR", "Polar array"), ("Break", "BREAK", "Break  (BR)"), ("Join", "JOIN", "Join  (J)"),
             ("Explode", "EXPLODE", "Explode  (X)"), ("Erase", "ERASE", "Erase  (E)"),
         ];
-        let anno_tools: &[(&'static str, &'static str, &'static str)] = &[("Linear", "DIMLINEAR", "Linear dimension  (DLI)")];
+        let anno_tools: &[(&'static str, &'static str, &'static str)] = &[
+            ("Text", "TEXT", "Single-line text  (T)"), ("Linear", "DIMLINEAR", "Linear dimension  (DLI)"),
+        ];
+        let cap = Color32::from_rgb(128, 146, 166);
         let mut fire: Option<&'static str> = None;
 
+        // ---- menu bar + quick actions ----
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() { self.doc = Document::new(); self.clear_refs(); self.end_cmd(); self.zoom_extents(); ui.close_menu(); }
-                    if ui.button("Import DXF (opencad.dxf)").clicked() {
-                        match std::fs::read("opencad.dxf") {
-                            Ok(b) => { self.import_bytes(&b); self.prompt = format!("Imported {} entities", self.doc.objs.len()); }
-                            Err(e) => { self.prompt = format!("Import failed: {}", e); }
-                        }
-                        ui.close_menu();
-                    }
+                    if ui.button("New").clicked() { self.confirm = Some(Confirm::New); ui.close_menu(); }
+                    if ui.button("Import DXF (opencad.dxf)").clicked() { self.confirm = Some(Confirm::Import); ui.close_menu(); }
                     if ui.button("Export DXF → opencad.dxf").clicked() {
                         self.prompt = match std::fs::write("opencad.dxf", self.doc.to_dxf()) {
                             Ok(_) => "Wrote opencad.dxf".into(), Err(e) => format!("Export failed: {}", e),
@@ -1172,11 +1256,9 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
-                    if ui.button("Undo").clicked() { self.do_undo(); ui.close_menu(); }
-                    if ui.button("Redo").clicked() { self.do_redo(); ui.close_menu(); }
+                    if ui.button("Undo  Ctrl+Z").clicked() { self.do_undo(); ui.close_menu(); }
+                    if ui.button("Redo  Ctrl+Y").clicked() { self.do_redo(); ui.close_menu(); }
                 });
-                ui.menu_button("Draw", |ui| { for (l, c, _) in draw_tools { if ui.button(*l).clicked() { fire = Some(c); ui.close_menu(); } } });
-                ui.menu_button("Modify", |ui| { for (l, c, _) in modify_tools { if ui.button(*l).clicked() { fire = Some(c); ui.close_menu(); } } });
                 ui.menu_button("View", |ui| {
                     if ui.button("Zoom Extents").clicked() { self.zoom_extents(); ui.close_menu(); }
                     ui.separator();
@@ -1186,32 +1268,82 @@ impl eframe::App for App {
                     ui.checkbox(&mut self.snap_grid, "Snap to grid (F9)");
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("native · Rust").small().color(Color32::from_rgb(120, 140, 160)));
+                    ui.label(egui::RichText::new("native · Rust").small().color(cap));
                     ui.label(egui::RichText::new("◢ OpenCAD").strong().color(Color32::from_rgb(55, 212, 232)));
                 });
             });
         });
 
+        // ---- ribbon tabs ----
+        egui::TopBottomPanel::top("ribbontabs").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (i, t) in ["Home", "Insert", "Annotate", "View"].iter().enumerate() {
+                    if ui.selectable_label(self.ribbon_tab == i, egui::RichText::new(*t).size(13.0)).clicked() { self.ribbon_tab = i; }
+                }
+            });
+        });
+
+        // ---- ribbon content (icon panels for the active tab) ----
         egui::TopBottomPanel::top("ribbon").show(ctx, |ui| {
-            ui.add_space(3.0);
-            ui.horizontal_wrapped(|ui| {
-                let group = |ui: &mut egui::Ui, title: &str, tools: &[(&'static str, &'static str, &'static str)], fire: &mut Option<&'static str>| {
-                    ui.vertical(|ui| {
-                        ui.horizontal_wrapped(|ui| { for (l, c, t) in tools { if tool_btn(ui, l, t) { *fire = Some(*c); } } });
-                        ui.add_space(1.0);
-                        ui.label(egui::RichText::new(title).size(9.0).color(Color32::from_rgb(120, 140, 160)));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let grp = |ui: &mut egui::Ui, title: &str, tools: &[(&'static str, &'static str, &'static str)], fire: &mut Option<&'static str>| {
+                    ui.group(|ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| { for (l, c, t) in tools { if icon_btn(ui, c, l, t) { *fire = Some(*c); } } });
+                            ui.label(egui::RichText::new(title).size(9.5).color(cap));
+                        });
                     });
                 };
-                group(ui, "DRAW", draw_tools, &mut fire);
-                ui.separator();
-                group(ui, "MODIFY", modify_tools, &mut fire);
-                ui.separator();
-                group(ui, "ANNOTATE", anno_tools, &mut fire);
+                match self.ribbon_tab {
+                    0 => { grp(ui, "Draw", draw_tools, &mut fire); grp(ui, "Modify", modify_tools, &mut fire); grp(ui, "Annotation", anno_tools, &mut fire); }
+                    1 => {
+                        ui.group(|ui| { ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button("⬇ Import DXF").clicked() { self.confirm = Some(Confirm::Import); }
+                                if ui.button("⬆ Export DXF").clicked() {
+                                    self.prompt = match std::fs::write("opencad.dxf", self.doc.to_dxf()) { Ok(_) => "Wrote opencad.dxf".into(), Err(e) => format!("Export failed: {}", e) };
+                                }
+                            });
+                            ui.label(egui::RichText::new("Data (DXF)").size(9.5).color(cap));
+                        }); });
+                        ui.label(egui::RichText::new("…or drag a .dxf onto the window").small().color(cap));
+                    }
+                    2 => { grp(ui, "Dimensions & Text", anno_tools, &mut fire); }
+                    _ => {
+                        ui.group(|ui| { ui.vertical(|ui| {
+                            ui.horizontal(|ui| { if ui.button("Zoom Extents").clicked() { self.zoom_extents(); } });
+                            ui.label(egui::RichText::new("Navigate").size(9.5).color(cap));
+                        }); });
+                        ui.group(|ui| { ui.vertical(|ui| {
+                            ui.horizontal(|ui| { ui.checkbox(&mut self.grid, "Grid"); ui.checkbox(&mut self.osnap, "Osnap"); ui.checkbox(&mut self.ortho, "Ortho"); });
+                            ui.label(egui::RichText::new("Display").size(9.5).color(cap));
+                        }); });
+                    }
+                }
             });
-            ui.add_space(3.0);
+            ui.add_space(4.0);
         });
         if let Some(c) = fire { self.start_cmd(c); }
 
+        // ---- status bar (very bottom): coords + the AutoCAD toggle set ----
+        egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.monospace(egui::RichText::new(format!("{:.2}, {:.2}, 0.00", self.cur.0, self.cur.1)).color(Color32::from_rgb(200, 212, 226)));
+                ui.separator();
+                if ui.selectable_label(self.snap_grid, "SNAP").on_hover_text("Snap to grid (F9)").clicked() { self.snap_grid = !self.snap_grid; }
+                if ui.selectable_label(self.grid, "GRID").on_hover_text("Grid display (F7)").clicked() { self.grid = !self.grid; }
+                if ui.selectable_label(self.ortho, "ORTHO").on_hover_text("Ortho (F8)").clicked() { self.ortho = !self.ortho; }
+                if ui.selectable_label(self.polar, "POLAR").on_hover_text("Polar tracking").clicked() { self.polar = !self.polar; }
+                if ui.selectable_label(self.osnap, "OSNAP").on_hover_text("Object snap (F3)").clicked() { self.osnap = !self.osnap; }
+                if ui.selectable_label(self.lwt, "LWT").on_hover_text("Show lineweight").clicked() { self.lwt = !self.lwt; }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{} objects", self.doc.objs.len())).small().color(Color32::from_rgb(130, 148, 168)));
+                });
+            });
+        });
+
+        // ---- command line ----
         egui::TopBottomPanel::bottom("cmdline").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&self.prompt).monospace().color(Color32::from_rgb(255, 180, 84)));
@@ -1226,13 +1358,15 @@ impl eframe::App for App {
                     r.request_focus();
                 }
             });
+        });
+
+        // ---- model / layout tabs ----
+        egui::TopBottomPanel::bottom("layouttabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.monospace(format!("X {:.0}   Y {:.0}", self.cur.0, self.cur.1));
-                ui.separator();
-                if ui.selectable_label(self.grid, "GRID").clicked() { self.grid = !self.grid; }
-                if ui.selectable_label(self.snap_grid, "SNAP").clicked() { self.snap_grid = !self.snap_grid; }
-                if ui.selectable_label(self.ortho, "ORTHO").clicked() { self.ortho = !self.ortho; }
-                if ui.selectable_label(self.osnap, "OSNAP").clicked() { self.osnap = !self.osnap; }
+                ui.add_space(4.0);
+                let _ = ui.selectable_label(true, egui::RichText::new("Model").size(12.0));
+                if ui.selectable_label(false, egui::RichText::new("Layout1").size(12.0).color(cap)).clicked() { self.prompt = "Paper-space layouts are on the roadmap.".into(); }
+                if ui.selectable_label(false, egui::RichText::new("Layout2").size(12.0).color(cap)).clicked() { self.prompt = "Paper-space layouts are on the roadmap.".into(); }
             });
         });
 
@@ -1309,14 +1443,28 @@ impl eframe::App for App {
                     Err(e) => format!("Export failed: {}", e),
                 };
             }
-            if ui.button("Import DXF (opencad.dxf)").clicked() {
-                match std::fs::read("opencad.dxf") {
-                    Ok(bytes) => { self.import_bytes(&bytes); self.prompt = format!("Imported {} entities", self.doc.objs.len()); }
-                    Err(e) => { self.prompt = format!("Import failed: {}", e); }
-                }
-            }
+            if ui.button("Import DXF (opencad.dxf)").clicked() { self.confirm = Some(Confirm::Import); }
             ui.label(egui::RichText::new("…or drag a .dxf onto the window").small().color(Color32::GRAY));
         });
+
+        if let Some(act) = self.confirm {
+            egui::Window::new(match act { Confirm::New => "New drawing", Confirm::Import => "Import DXF" })
+                .collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(match act {
+                        Confirm::New => "Start a new drawing? Unsaved work will be lost (there's no undo past this).",
+                        Confirm::Import => "Import opencad.dxf? It replaces the current drawing (no undo past this).",
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(match act { Confirm::New => "New drawing", Confirm::Import => "Import" }).clicked() {
+                            match act { Confirm::New => self.do_new(), Confirm::Import => self.do_import_file() }
+                            self.confirm = None;
+                        }
+                        if ui.button("Cancel").clicked() { self.confirm = None; }
+                    });
+                });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(Color32::from_rgb(9, 13, 18)))
