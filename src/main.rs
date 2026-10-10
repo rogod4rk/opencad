@@ -23,7 +23,7 @@ fn app_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 760.0])
+            .with_inner_size([1480.0, 880.0])
             .with_title("OpenCAD")
             .with_icon(app_icon()),
         ..Default::default()
@@ -1286,7 +1286,7 @@ impl eframe::App for App {
         // ---- ribbon content (icon panels for the active tab) ----
         egui::TopBottomPanel::top("ribbon").show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let grp = |ui: &mut egui::Ui, title: &str, tools: &[(&'static str, &'static str, &'static str)], fire: &mut Option<&'static str>| {
                     ui.group(|ui| {
                         ui.vertical(|ui| {
@@ -1334,8 +1334,10 @@ impl eframe::App for App {
                 if ui.selectable_label(self.snap_grid, "SNAP").on_hover_text("Snap to grid (F9)").clicked() { self.snap_grid = !self.snap_grid; }
                 if ui.selectable_label(self.grid, "GRID").on_hover_text("Grid display (F7)").clicked() { self.grid = !self.grid; }
                 if ui.selectable_label(self.ortho, "ORTHO").on_hover_text("Ortho (F8)").clicked() { self.ortho = !self.ortho; }
+                // ponytail: visual toggle only; wire self.polar into snap() angle-locking in a later phase
                 if ui.selectable_label(self.polar, "POLAR").on_hover_text("Polar tracking").clicked() { self.polar = !self.polar; }
                 if ui.selectable_label(self.osnap, "OSNAP").on_hover_text("Object snap (F3)").clicked() { self.osnap = !self.osnap; }
+                // ponytail: visual toggle only; honor self.lwt in draw_entity stroke width in a later phase
                 if ui.selectable_label(self.lwt, "LWT").on_hover_text("Show lineweight").clicked() { self.lwt = !self.lwt; }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(format!("{} objects", self.doc.objs.len())).small().color(Color32::from_rgb(130, 148, 168)));
